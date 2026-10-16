@@ -39,6 +39,7 @@ jobs:
           npm run build
         env:
           GITHUB_PAGES: "true"
+          VITE_USE_CUSTOM_DOMAIN: "true"
           VITE_API_BASE_URL: ${{ vars.API_BASE_URL }}
 
       - uses: actions/upload-pages-artifact@v4
