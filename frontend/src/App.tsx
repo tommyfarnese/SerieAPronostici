@@ -11,7 +11,8 @@ type MatchDetails = { match: Match; homeRecent: RecentMatch[]; awayRecent: Recen
 type MatchState = { matches: Match[]; history: Match[]; loading: boolean; error: string | null; provider: string }
 type Pick = { match: Match; label: string; probability: number }
 type TicketProfile = 'medium' | 'risky'
-type Ticket = { key: string; title: string; profile: TicketProfile; picks: Pick[] }
+type TicketKind = 'multigol' | '1x2' | 'mixed'
+type Ticket = { key: string; title: string; profile: TicketProfile; kind: TicketKind; picks: Pick[] }
 
 const Form = ({ value }: { value: string }) => <span className="form">{value.split(' ').map((x, i) => <i key={i} className={x === 'V' ? 'win' : x === 'P' ? 'loss' : 'draw'}>{x}</i>)}</span>
 const TeamBadge = ({ name, crest }: { name: string; crest?: string | null }) => crest
@@ -43,18 +44,49 @@ const multigolCandidates = (match: Match): Pick[] => multigolOptions.flatMap(hom
     label: `Multigol casa ${homeBand} + ospite ${awayBand}`,
     probability: multigolProbability(match, homeBand, awayBand),
   })))
-const pickForProfile = (match: Match, profile: TicketProfile): Pick => {
+const bandBreadth = (pick: Pick) => {
+  const bands = [...pick.label.matchAll(/(?:casa|ospite) (\d)-(\d)/g)].map(([, start, end]) => ({ start: Number(start), end: Number(end) }))
+  return bands.reduce((sum, band) => sum + band.end - band.start, 0)
+}
+const broadBandCount = (pick: Pick) => [...pick.label.matchAll(/(?:casa|ospite) 1-4/g)].length
+const pickMultigol = (match: Match, profile: TicketProfile): Pick => {
   const candidates = multigolCandidates(match).sort((a, b) => b.probability - a.probability)
   const bestProbability = candidates[0]?.probability ?? 0
-  const target = profile === 'medium' ? 0.88 : 0.65
-  const minimumProbability = profile === 'medium' ? 0.65 : 0.45
-  const alternatives = candidates.slice(1).filter(pick => pick.probability >= bestProbability * 0.5)
-  const inProfile = alternatives.filter(pick => {
-    const ratio = pick.probability / bestProbability
-    return pick.probability >= minimumProbability && (profile === 'medium' ? ratio >= 0.75 && ratio <= 0.93 : ratio >= 0.5 && ratio <= 0.75)
-  })
-  if (!inProfile.length) return candidates[0]
-  return inProfile.sort((a, b) => Math.abs(a.probability / bestProbability - target) - Math.abs(b.probability / bestProbability - target))[0]
+  if (!bestProbability) return candidates[0]
+  if (profile === 'medium') {
+    const nearBest = candidates.filter(pick => pick.probability >= bestProbability * 0.9)
+    return nearBest.sort((a, b) => broadBandCount(a) - broadBandCount(b) || bandBreadth(a) - bandBreadth(b) || b.probability - a.probability)[0]
+  }
+  const alternatives = candidates.filter(pick => pick.probability >= bestProbability * 0.5 && pick.probability <= bestProbability * 0.78 && pick.probability >= 0.35)
+  return alternatives.sort((a, b) => Math.abs(a.probability / bestProbability - 0.66) - Math.abs(b.probability / bestProbability - 0.66) || broadBandCount(a) - broadBandCount(b) || bandBreadth(a) - bandBreadth(b) || b.probability - a.probability)[0] ?? candidates[0]
+}
+const oneXTwoCandidates = (match: Match): Pick[] => [
+  { match, label: '1 · Vittoria casa', probability: match.probabilities.home / 100 },
+  { match, label: 'X · Pareggio', probability: match.probabilities.draw / 100 },
+  { match, label: '2 · Vittoria ospite', probability: match.probabilities.away / 100 },
+]
+const doubleChanceCandidates = (match: Match): Pick[] => [
+  { match, label: 'Doppia chance 1X', probability: (match.probabilities.home + match.probabilities.draw) / 100 },
+  { match, label: 'Doppia chance 12', probability: (match.probabilities.home + match.probabilities.away) / 100 },
+  { match, label: 'Doppia chance X2', probability: (match.probabilities.draw + match.probabilities.away) / 100 },
+]
+const pickOutcome = (match: Match, profile: TicketProfile): Pick => {
+  const candidates = oneXTwoCandidates(match).sort((a, b) => b.probability - a.probability)
+  return profile === 'risky' && candidates[1].probability >= 0.2 ? candidates[1] : candidates[0]
+}
+const pickDoubleChance = (match: Match, profile: TicketProfile): Pick => {
+  const candidates = doubleChanceCandidates(match).sort((a, b) => b.probability - a.probability)
+  const riskier = [...candidates].sort((a, b) => a.probability - b.probability)[0]
+  return profile === 'risky' && riskier.probability >= 0.45 ? riskier : candidates[0]
+}
+const pickForTicket = (match: Match, profile: TicketProfile, kind: TicketKind, index = 0): Pick => {
+  if (kind === '1x2') return pickOutcome(match, profile)
+  if (kind === 'mixed' && index % 2 === 1) return pickDoubleChance(match, profile)
+  return pickMultigol(match, profile)
+}
+const balancedMultigolBands = (match: Match): Match['bands'] => {
+  const selected = /Multigol casa (\d-\d) \+ ospite (\d-\d)/.exec(pickMultigol(match, 'medium').label)
+  return selected ? { home: selected[1], away: selected[2], total: match.bands.total } : match.bands
 }
 
 const roundNumber = (round: string) => Number(round.match(/\d+/)?.[0] ?? 999)
@@ -73,7 +105,7 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
   const [visibleHistoryCount, setVisibleHistoryCount] = useState(12)
-  const [ticketSelections, setTicketSelections] = useState<Record<string, string[]>>({})
+  const [ticketSelections, setTicketSelections] = useState<Record<string, Pick[]>>({})
   const [ticketAddChoices, setTicketAddChoices] = useState<Record<string, string>>({})
   const [copiedTicket, setCopiedTicket] = useState('')
 
@@ -94,15 +126,28 @@ export default function App() {
   const { matches, history, loading, error, provider } = state
   const rounds = useMemo(() => [...new Set(matches.map(match => match.round))].sort((a, b) => roundNumber(a) - roundNumber(b)), [matches])
   const historyRounds = useMemo(() => [...new Set(history.map(match => match.round))].sort((a, b) => roundNumber(a) - roundNumber(b)), [history])
-  const visibleMatches = useMemo(() => selectedRound ? matches.filter(match => match.round === selectedRound) : matches, [matches, selectedRound])
+  const visibleMatches = useMemo(() => (selectedRound ? matches.filter(match => match.round === selectedRound) : matches)
+    .map(match => ({ ...match, bands: balancedMultigolBands(match) })), [matches, selectedRound])
   const tickets = useMemo<Ticket[]>(() => {
     if (!selectedRound) return []
     if (!visibleMatches.length) return []
     const counts = [...new Set([Math.min(3, visibleMatches.length), Math.min(5, visibleMatches.length), visibleMatches.length])]
-    return (['medium', 'risky'] as const).flatMap(profile => {
-      const candidates = visibleMatches.map(match => pickForProfile(match, profile)).sort((a, b) => b.probability - a.probability)
-      return counts.map(count => ({ key: `${selectedRound}:${profile}:${count}`, profile, title: count === candidates.length ? 'Tutta la giornata' : `Da ${count} partite`, picks: candidates.slice(0, count) }))
-    })
+    const kinds: TicketKind[] = ['multigol', '1x2', 'mixed']
+    const kindNames: Record<TicketKind, string> = { multigol: 'Solo multigol', '1x2': 'Solo 1X2', mixed: 'Mista · multigol + doppia chance' }
+    return (['medium', 'risky'] as const).flatMap(profile => kinds.flatMap(kind => {
+      const rankedMatches = visibleMatches.map(match => {
+        const score = kind === 'mixed'
+          ? Math.max(pickMultigol(match, profile).probability, pickDoubleChance(match, profile).probability)
+          : pickForTicket(match, profile, kind).probability
+        return { match, score }
+      }).sort((a, b) => b.score - a.score)
+      return counts.map(count => {
+        const selectedMatches = rankedMatches.slice(0, count).map(item => item.match)
+        const picks = selectedMatches.map((match, index) => pickForTicket(match, profile, kind, index))
+        const size = count === visibleMatches.length ? 'Tutta la giornata' : `Da ${count} partite`
+        return { key: `${selectedRound}:${profile}:${kind}:${count}`, profile, kind, title: `${kindNames[kind]} · ${size}`, picks }
+      })
+    }))
   }, [visibleMatches, selectedRound])
   const historyMatches = useMemo(() => {
     const filtered = selectedHistoryRound ? history.filter(match => match.round === selectedHistoryRound) : history
@@ -118,30 +163,29 @@ export default function App() {
     const outcomes = [actual === '1' ? 1 : 0, actual === 'X' ? 1 : 0, actual === '2' ? 1 : 0]
     return sum + probabilities.reduce((score, probability, index) => score + (probability - outcomes[index]) ** 2, 0) / 3
   }, 0) / accuracy.length : 0
-
   const openDetails = async (match: Match) => {
     setDetail(null); setDetailError(''); setDetailLoading(true)
     try {
       const response = await fetch(`${apiBase}/api/matches/${match.id}/details`)
       if (!response.ok) throw new Error('Dettaglio partita non disponibile.')
-      setDetail(await response.json() as MatchDetails)
+      const details = await response.json() as MatchDetails
+      setDetail({ ...details, match: { ...details.match, bands: balancedMultigolBands(details.match) } })
     } catch (error) { setDetailError(error instanceof Error ? error.message : 'Errore nel caricamento del dettaglio.') }
     finally { setDetailLoading(false) }
   }
 
-  const saveTicketPicks = (ticket: Ticket, picks: Pick[]) => setTicketSelections(current => ({ ...current, [ticket.key]: picks.map(pick => matchKey(pick.match)) }))
-  const ticketPicks = (ticket: Ticket) => {
-    const selectedKeys = ticketSelections[ticket.key] ?? ticket.picks.map(pick => matchKey(pick.match))
-    const pool = visibleMatches.map(match => pickForProfile(match, ticket.profile))
-    return selectedKeys.map(key => pool.find(pick => matchKey(pick.match) === key)).filter((pick): pick is Pick => Boolean(pick))
+  const saveTicketPicks = (ticket: Ticket, picks: Pick[]) => {
+    const normalized = ticket.kind === 'mixed' ? picks.map((pick, index) => pickForTicket(pick.match, ticket.profile, ticket.kind, index)) : picks
+    setTicketSelections(current => ({ ...current, [ticket.key]: normalized }))
   }
+  const ticketPicks = (ticket: Ticket) => ticketSelections[ticket.key] ?? ticket.picks
   const addTicketMatch = (ticket: Ticket) => {
     const key = ticketAddChoices[ticket.key]
     const match = visibleMatches.find(item => matchKey(item) === key)
     if (!match) return
     const picks = ticketPicks(ticket)
     if (picks.some(pick => matchKey(pick.match) === key)) return
-    saveTicketPicks(ticket, [...picks, pickForProfile(match, ticket.profile)])
+    saveTicketPicks(ticket, [...picks, pickForTicket(match, ticket.profile, ticket.kind, picks.length)])
     setTicketAddChoices(current => ({ ...current, [ticket.key]: '' }))
   }
   const copyTicket = async (ticket: Ticket) => {
@@ -159,16 +203,16 @@ export default function App() {
     <section id="partite" className="section-head"><div><span className="eyebrow muted">PROSSIME PARTITE</span><h2>{selectedRound || 'Tutte le giornate'}</h2></div><label className="round-filter">Giornata<select value={selectedRound} onChange={event => setSelectedRound(event.target.value)}><option value="">Tutte</option>{rounds.map(round => <option value={round} key={round}>{round}</option>)}</select></label></section>
     <section className="matches">{loading ? <div className="api-message">Caricamento delle partite…</div> : error ? <div className="api-message error">{error}</div> : visibleMatches.length === 0 ? <div className="api-message">Nessuna partita disponibile per questa giornata.</div> : visibleMatches.map((match, index) => <article className="match" key={matchKey(match)}><div className="match-info"><span className="round">{match.round} <span>·</span> {match.date}</span><div className="teams"><div className="team-side"><TeamBadge name={match.home} crest={match.homeCrest}/><strong>{match.home}</strong></div><span className="versus">—</span><div className="team-side"><TeamBadge name={match.away} crest={match.awayCrest}/><strong>{match.away}</strong></div></div><div className="forms"><span><Form value={match.homeForm}/></span><span className="form-divider"/><span><Form value={match.awayForm}/></span></div></div><div className="prob"><div className="prob-title">PROBABILITÀ 1X2</div><div className="bar"><i style={{width: `${match.probabilities.home}%`}}/><i style={{width: `${match.probabilities.draw}%`}}/><i style={{width: `${match.probabilities.away}%`}}/></div><div className="prob-labels"><span><b>{match.probabilities.home}%</b> 1</span><span><b>{match.probabilities.draw}%</b> X</span><span><b>{match.probabilities.away}%</b> 2</span></div></div><div className="markets"><div className="prob-title">FASCE GOL STIMATE</div><div className="pills"><span><b>{match.bands.home}</b><small>CASA</small></span><span><b>{match.bands.away}</b><small>OSPITE</small></span><span><b>{match.bands.total}</b><small>TOTALE</small></span></div></div><div className="goals"><div className="prob-title">MEDIA GOL / GARA</div><span>{match.homeGoals}<small> casa</small></span><span className="goal-slash">/</span><span>{match.awayGoals}<small> ospite</small></span><button className="details-button" onClick={() => void openDetails(match)}>Dettaglio</button></div><div className="row-num">{String(index + 1).padStart(2, '0')}</div></article>)}</section>
 
-    <section id="schedine" className="tickets-section"><div className="section-head"><div><span className="eyebrow muted">SELEZIONI DAL MODELLO</span><h2>Schedine suggerite · 3 € ciascuna</h2></div></div><p className="ticket-intro">Ogni giornata propone due profili: le schedine medie scelgono alternative vicine alla selezione più probabile; quelle rischiose scelgono alternative meno probabili, ma sempre tra le combinazioni valide. Puoi personalizzare il numero di partite, rimuoverle o aggiungerle. La probabilità complessiva è indicativa e assume indipendenza tra le partite.</p>{!selectedRound ? <div className="api-message">Seleziona una singola giornata per preparare le schedine.</div> : <>{(['medium', 'risky'] as const).map(profile => {
+    <section id="schedine" className="tickets-section"><div className="section-head"><div><span className="eyebrow muted">SELEZIONI DAL MODELLO</span><h2>Schedine suggerite · 3 € ciascuna</h2></div></div><p className="ticket-intro">Per ogni giornata trovi schedine solo multigol, solo 1X2 e miste con multigol e doppia chance, in versione media e rischiosa. Puoi personalizzare il numero di partite, rimuoverle o aggiungerle. La probabilità complessiva è indicativa e assume indipendenza tra le partite.</p>{!selectedRound ? <div className="api-message">Seleziona una singola giornata per preparare le schedine.</div> : <>{(['medium', 'risky'] as const).map(profile => {
       const profileTickets = tickets.filter(ticket => ticket.profile === profile)
       const profileName = profile === 'medium' ? 'Medie · poco rischiose' : 'Rischiose'
-      const profileDescription = profile === 'medium' ? 'Usa alternative vicine alla più probabile solo se raggiungono almeno il 65%; altrimenti sceglie quella con probabilità massima.' : 'Usa alternative al 50–75% della più probabile, con almeno il 45% di probabilità; altrimenti sceglie quella con probabilità massima.'
+      const profileDescription = profile === 'medium' ? 'Privilegia gli esiti più probabili; sulle multigol preferisce fasce più strette quando la probabilità è simile.' : 'Sceglie alternative meno probabili ma plausibili; le schedine miste alternano multigol e doppia chance.'
       return <div className="ticket-profile" key={profile}><div className="ticket-profile-head"><h3>{profileName}</h3><p>{profileDescription}</p></div><div className="ticket-grid">{profileTickets.map(ticket => {
       const picks = ticketPicks(ticket)
       const selectedKeys = new Set(picks.map(pick => matchKey(pick.match)))
       const choices = visibleMatches.filter(match => !selectedKeys.has(matchKey(match)))
       const combinedProbability = picks.length ? picks.reduce((probability, pick) => probability * pick.probability, 1) : 0
-      return <article className="ticket" key={ticket.key}><div className="ticket-head"><div><span className="eyebrow muted">{selectedRound.toUpperCase()}</span><h3>{ticket.title}</h3></div><strong>3 €</strong></div><div className="ticket-combined">Probabilità combinata stimata <b>{picks.length ? `${Math.round(combinedProbability * 100)}%` : '—'}</b></div>{picks.map(pick => <div className="ticket-pick" key={matchKey(pick.match)}><span>{pick.match.home} – {pick.match.away}</span><b>{pick.label}</b><small>{Math.round(pick.probability * 100)}% stimata</small><button className="remove-pick" onClick={() => saveTicketPicks(ticket, picks.filter(item => matchKey(item.match) !== matchKey(pick.match)))}>Rimuovi</button></div>)}<div className="ticket-edit"><select aria-label="Aggiungi partita" value={ticketAddChoices[ticket.key] ?? ''} onChange={event => setTicketAddChoices(current => ({ ...current, [ticket.key]: event.target.value }))}><option value="">Aggiungi una partita…</option>{choices.map(match => <option value={matchKey(match)} key={matchKey(match)}>{match.home} – {match.away}</option>)}</select><button onClick={() => addTicketMatch(ticket)} disabled={!ticketAddChoices[ticket.key]}>Aggiungi</button></div><button className="copy-ticket" onClick={() => void copyTicket(ticket)}>{copiedTicket === ticket.key ? 'Copiata' : 'Copia schedina'}</button></article>
+      return <article className="ticket" key={ticket.key}><div className="ticket-head"><div><span className="eyebrow muted">{selectedRound.toUpperCase()} · {ticket.kind === 'mixed' ? 'MISTA' : ticket.kind === '1x2' ? '1X2' : 'MULTIGOL'}</span><h3>{ticket.title}</h3></div><strong>3 €</strong></div><div className="ticket-combined">Probabilità combinata stimata <b>{picks.length ? `${Math.round(combinedProbability * 100)}%` : '—'}</b></div>{picks.map(pick => <div className="ticket-pick" key={matchKey(pick.match)}><span>{pick.match.home} – {pick.match.away}</span><b>{pick.label}</b><small>{Math.round(pick.probability * 100)}% stimata</small><button className="remove-pick" onClick={() => saveTicketPicks(ticket, picks.filter(item => matchKey(item.match) !== matchKey(pick.match)))}>Rimuovi</button></div>)}<div className="ticket-edit"><select aria-label="Aggiungi partita" value={ticketAddChoices[ticket.key] ?? ''} onChange={event => setTicketAddChoices(current => ({ ...current, [ticket.key]: event.target.value }))}><option value="">Aggiungi una partita…</option>{choices.map(match => <option value={matchKey(match)} key={matchKey(match)}>{match.home} – {match.away}</option>)}</select><button onClick={() => addTicketMatch(ticket)} disabled={!ticketAddChoices[ticket.key]}>Aggiungi</button></div><button className="copy-ticket" onClick={() => void copyTicket(ticket)}>{copiedTicket === ticket.key ? 'Copiata' : 'Copia schedina'}</button></article>
     })}</div></div>
     })}</>}</section>
 
